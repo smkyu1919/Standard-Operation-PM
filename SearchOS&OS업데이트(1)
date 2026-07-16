@@ -1,0 +1,426 @@
+# =========================
+# 분기별 수정 영역
+# =========================
+$KB2016  = "KB5099535"
+$Key2016 = "2026pm/02/windows/windows10.0-kb5099535-x64_272339725d88cf3a31a3ea9bf4e3e61ace5c2d91.msu"
+
+$KB2019  = "KB5099538"
+$Key2019 = "2026pm/02/windows10.0-kb5099538-x64_8ed669753c1d230738068aaac189c6457937dafb.msu"
+
+$KB2022  = "KB5099540"
+$Key2022 = "2026pm/02/windows10.0-kb5099540-x64_9238518dcf76e3b46d5c72e0392b0e04e5d2ae66.msu"
+
+# =========================
+# 공통 설정
+# =========================
+$TempDir = "C:\TempPM"
+$local = Join-Path $TempDir "windows-update-file.msu"
+$manifestPath = Join-Path $TempDir "patch-info.json"
+
+$AwsCliMsiUrl = "https://awscli.amazonaws.com/AWSCLIV2.msi"
+$AwsCliMsiPath = Join-Path $TempDir "AWSCLIV2.msi"
+$AwsCliInstallTimeoutSec = 1800
+
+$InstallTimeoutSec = 14400
+$RebootDelaySec = 120
+
+function Stop-Script {
+    param([int]$Code, [string]$Msg)
+    Write-Output $Msg
+    Write-Output ("RESULT_CODE : {0}" -f $Code)
+    exit $Code
+}
+
+function Try-Remove-TempDir {
+    param([string]$Reason = "CLEANUP")
+    try {
+        if (Test-Path $TempDir) {
+            Remove-Item -Path $TempDir -Recurse -Force -ErrorAction Stop
+            Write-Output "TEMP_DIR_REMOVED : $TempDir : reason=$Reason"
+        } else {
+            Write-Output "TEMP_DIR_NOT_FOUND : $TempDir : reason=$Reason"
+        }
+    } catch {
+        Write-Output "TEMP_DIR_REMOVE_FAILED : $TempDir : reason=$Reason"
+        Write-Output $_.Exception.Message
+    }
+}
+
+function Test-KBInstalled {
+    param([string]$KB)
+    try {
+        $hotFix = Get-HotFix -Id $KB -ErrorAction SilentlyContinue
+        return ($null -ne $hotFix)
+    } catch {
+        Write-Output "KB_CHECK_WARNING : Get-HotFix query failed"
+        Write-Output $_.Exception.Message
+        return $false
+    }
+}
+
+function Find-AwsCli {
+    $awsCommand = Get-Command aws.exe -ErrorAction SilentlyContinue
+    if ($awsCommand) {
+        return $awsCommand.Source
+    }
+
+    $candidatePaths = @(
+        "$env:ProgramFiles\Amazon\AWSCLIV2\aws.exe",
+        "$env:ProgramFiles\Amazon\AWSCLI\bin\aws.exe"
+    )
+
+    if (${env:ProgramFiles(x86)}) {
+        $candidatePaths += "${env:ProgramFiles(x86)}\Amazon\AWSCLI\bin\aws.exe"
+    }
+
+    foreach ($candidatePath in $candidatePaths) {
+        if (Test-Path $candidatePath) {
+            return $candidatePath
+        }
+    }
+
+    return $null
+}
+
+function Ensure-AwsCli {
+    $script:AwsExe = Find-AwsCli
+
+    if ($script:AwsExe) {
+        $awsVersion = & $script:AwsExe --version 2>&1
+        Write-Output ("AWSCLI_FOUND : path={0} version={1}" -f $script:AwsExe, ($awsVersion -join " "))
+        return
+    }
+
+    Write-Output "AWSCLI_NOT_FOUND"
+    Write-Output "AWSCLI_INSTALL_START"
+
+    if (-not [Environment]::Is64BitOperatingSystem) {
+        Stop-Script -Code 40 -Msg "AWSCLI_INSTALL_FAILED : 64-bit Windows required"
+    }
+
+    try {
+        New-Item -ItemType Directory -Force -Path $TempDir -ErrorAction Stop | Out-Null
+        if (Test-Path $AwsCliMsiPath) {
+            Remove-Item -Path $AwsCliMsiPath -Force -ErrorAction Stop
+        }
+    } catch {
+        Write-Output $_.Exception.Message
+        Stop-Script -Code 41 -Msg "AWSCLI_INSTALLER_PATH_PREPARE_FAILED"
+    }
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $AwsCliMsiUrl -OutFile $AwsCliMsiPath -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Write-Output $_.Exception.Message
+        Stop-Script -Code 42 -Msg "AWSCLI_INSTALLER_DOWNLOAD_FAILED"
+    }
+
+    if (-not (Test-Path $AwsCliMsiPath)) {
+        Stop-Script -Code 43 -Msg "AWSCLI_INSTALLER_NOT_FOUND"
+    }
+
+    $awsCliInstallerInfo = Get-Item $AwsCliMsiPath
+
+    if ($awsCliInstallerInfo.Length -le 0) {
+        Stop-Script -Code 44 -Msg "AWSCLI_INSTALLER_FILE_INVALID"
+    }
+
+    try {
+        $msiArguments = "/i `"$AwsCliMsiPath`" /qn /norestart"
+        $msiProcess = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArguments -PassThru -ErrorAction Stop
+    } catch {
+        Write-Output $_.Exception.Message
+        Stop-Script -Code 45 -Msg "AWSCLI_INSTALL_PROCESS_START_FAILED"
+    }
+
+    $installElapsed = 0
+
+    while (-not $msiProcess.HasExited) {
+        Start-Sleep -Seconds 5
+        $installElapsed += 5
+        $msiProcess.Refresh()
+
+        if ($installElapsed -ge $AwsCliInstallTimeoutSec) {
+            try {
+                Stop-Process -Id $msiProcess.Id -Force -ErrorAction Stop
+            } catch {
+                Write-Output $_.Exception.Message
+            }
+
+            Stop-Script -Code 46 -Msg "AWSCLI_INSTALL_TIMEOUT"
+        }
+    }
+
+    if ($msiProcess.ExitCode -ne 0 -and $msiProcess.ExitCode -ne 3010) {
+        Stop-Script -Code 47 -Msg ("AWSCLI_INSTALL_FAILED : exitCode={0}" -f $msiProcess.ExitCode)
+    }
+
+    $script:AwsExe = Find-AwsCli
+
+    if (-not $script:AwsExe) {
+        Stop-Script -Code 48 -Msg "AWSCLI_INSTALL_FAILED : aws.exe not found after installation"
+    }
+
+    try {
+        Remove-Item -Path $AwsCliMsiPath -Force -ErrorAction SilentlyContinue
+    } catch {
+    }
+
+    $awsVersion = & $script:AwsExe --version 2>&1
+    Write-Output ("AWSCLI_INSTALL_OK : path={0} version={1}" -f $script:AwsExe, ($awsVersion -join " "))
+}
+
+function Test-RebootPending {
+    $pending = $false
+
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+        $pending = $true
+    }
+
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+        $pending = $true
+    }
+
+    try {
+        $pendingRename = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
+
+        if ($pendingRename.PendingFileRenameOperations) {
+            $pending = $true
+        }
+    } catch {
+    }
+
+    return $pending
+}
+
+function Get-UnsignedExitCode {
+    param([int]$ExitCode)
+    return [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$ExitCode), 0)
+}
+
+function Request-RebootAndComplete {
+    param([string]$Reason, [string]$KB)
+
+    Write-Output "REBOOT_REQUIRED"
+    Write-Output ("REBOOT_REASON : {0}" -f $Reason)
+
+    Try-Remove-TempDir -Reason "BEFORE_REBOOT_SCHEDULE"
+
+    Write-Output ("REBOOT_DELAY_START : {0}s" -f $RebootDelaySec)
+
+    try {
+        $shutdownExe = Join-Path $env:SystemRoot "System32\shutdown.exe"
+        & $shutdownExe /r /t $RebootDelaySec /f /c "Windows Update $KB installation completed. Scheduled reboot."
+        $shutdownExitCode = $LASTEXITCODE
+    } catch {
+        Write-Output $_.Exception.Message
+        Stop-Script -Code 31 -Msg "REBOOT_SCHEDULE_FAILED"
+    }
+
+    if ($shutdownExitCode -ne 0) {
+        Stop-Script -Code 32 -Msg ("REBOOT_SCHEDULE_FAILED : exitCode={0}" -f $shutdownExitCode)
+    }
+
+    Write-Output "REBOOT_SCHEDULED"
+    Write-Output ("REBOOT_AFTER_SECONDS : {0}" -f $RebootDelaySec)
+    Write-Output "RUN_COMMAND_COMPLETE_BEFORE_REBOOT"
+
+    exit 0
+}
+
+# =========================
+# 0) OS 제품명 자동 판별
+# =========================
+try {
+    $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    $osCaption = [string]$osInfo.Caption
+    $osProductType = [int]$osInfo.ProductType
+} catch {
+    Write-Output $_.Exception.Message
+    Stop-Script -Code 5 -Msg "OS_DETECTION_FAILED"
+}
+
+if ($osProductType -eq 1) {
+    Stop-Script -Code 6 -Msg ("UNSUPPORTED_OS : Windows client OS detected : {0}" -f $osCaption)
+}
+
+switch -Wildcard ($osCaption) {
+    "*Windows Server 2016*" {
+        $osYear = "2016"
+        $kb = $KB2016
+        $key = $Key2016
+        break
+    }
+    "*Windows Server 2019*" {
+        $osYear = "2019"
+        $kb = $KB2019
+        $key = $Key2019
+        break
+    }
+    "*Windows Server 2022*" {
+        $osYear = "2022"
+        $kb = $KB2022
+        $key = $Key2022
+        break
+    }
+    default {
+        Stop-Script -Code 7 -Msg ("UNSUPPORTED_OS : caption={0}" -f $osCaption)
+    }
+}
+
+$kbNorm = $kb.ToUpper()
+
+Write-Output ("OS_DETECTED : year={0} caption={1}" -f $osYear, $osCaption)
+Write-Output ("PATCH_SELECTED : kb={0} key={1}" -f $kbNorm, $key)
+
+# =========================
+# 1) 기존 설치 여부 확인
+# =========================
+if (Test-KBInstalled -KB $kbNorm) {
+    Write-Output "PATCH_ALREADY_INSTALLED : $kbNorm"
+    Write-Output "NO_ACTION : install/reboot skipped"
+    Try-Remove-TempDir -Reason "ALREADY_INSTALLED"
+    Stop-Script -Code 0 -Msg "DONE : ALREADY_INSTALLED"
+}
+
+# =========================
+# 2) AWS CLI 확인 및 자동 설치
+# =========================
+Ensure-AwsCli
+
+# =========================
+# 3) 다운로드 파일 및 Manifest 확인
+# =========================
+if (-not (Test-Path $local)) {
+    Stop-Script -Code 20 -Msg "LOCAL_PATCH_FILE_NOT_FOUND : run download script first"
+}
+
+if (-not (Test-Path $manifestPath)) {
+    Stop-Script -Code 21 -Msg "PATCH_MANIFEST_NOT_FOUND : run download script first"
+}
+
+try {
+    $manifest = Get-Content -Path $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json
+} catch {
+    Write-Output $_.Exception.Message
+    Stop-Script -Code 22 -Msg "PATCH_MANIFEST_READ_FAILED"
+}
+
+if ([string]$manifest.OSYear -ne $osYear) {
+    Stop-Script -Code 23 -Msg ("PATCH_OS_MISMATCH : manifestOS={0} currentOS={1}" -f $manifest.OSYear, $osYear)
+}
+
+if ($manifest.KB.ToUpper() -ne $kbNorm) {
+    Stop-Script -Code 24 -Msg ("PATCH_KB_MISMATCH : manifestKB={0} selectedKB={1}" -f $manifest.KB, $kbNorm)
+}
+
+$fileInfo = Get-Item $local
+
+if ($fileInfo.Length -ne [int64]$manifest.SizeBytes) {
+    Stop-Script -Code 25 -Msg "PATCH_FILE_SIZE_MISMATCH"
+}
+
+try {
+    $currentHash = Get-FileHash -Path $local -Algorithm SHA256 -ErrorAction Stop
+} catch {
+    Write-Output $_.Exception.Message
+    Stop-Script -Code 26 -Msg "PATCH_HASH_CALCULATION_FAILED"
+}
+
+if ($currentHash.Hash.ToUpper() -ne $manifest.SHA256.ToUpper()) {
+    Stop-Script -Code 27 -Msg "PATCH_FILE_HASH_MISMATCH"
+}
+
+Write-Output "PATCH_FILE_VALIDATION_OK"
+Write-Output ("LOCAL_PATCH_FILE : path={0} size={1}" -f $fileInfo.FullName, $fileInfo.Length)
+
+# =========================
+# 4) 설치 전 재부팅 보류 상태 확인
+# =========================
+$rebootPendingBefore = Test-RebootPending
+Write-Output ("REBOOT_PENDING_BEFORE_INSTALL : {0}" -f $rebootPendingBefore)
+
+# =========================
+# 5) WUSA 설치
+# =========================
+Write-Output "WUSA_INSTALL_START"
+
+try {
+    $process = Start-Process -FilePath "wusa.exe" -ArgumentList "`"$local`" /quiet /norestart" -PassThru -ErrorAction Stop
+} catch {
+    Write-Output $_.Exception.Message
+    Stop-Script -Code 28 -Msg "WUSA_PROCESS_START_FAILED"
+}
+
+$elapsed = 0
+
+while (-not $process.HasExited) {
+    Start-Sleep -Seconds 60
+    $elapsed += 60
+    $process.Refresh()
+
+    Write-Output ("WUSA_INSTALLING : elapsed={0}s" -f $elapsed)
+
+    if ($elapsed -ge $InstallTimeoutSec) {
+        try {
+            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+        } catch {
+            Write-Output $_.Exception.Message
+        }
+
+        Stop-Script -Code 29 -Msg "WUSA_INSTALL_TIMEOUT"
+    }
+}
+
+$exitRaw = [int]$process.ExitCode
+$exitUnsigned = Get-UnsignedExitCode -ExitCode $exitRaw
+$exitHex = "0x{0:X8}" -f $exitUnsigned
+
+Write-Output ("WUSA_INSTALL_END : exitCode={0} hex={1} elapsed={2}s" -f $exitRaw, $exitHex, $elapsed)
+
+# =========================
+# 6) WUSA 결과 분기
+# =========================
+if ($exitUnsigned -eq 0x00240006) {
+    Write-Output "PATCH_ALREADY_INSTALLED_BY_WUSA : $kbNorm"
+    Try-Remove-TempDir -Reason "WUSA_ALREADY_INSTALLED"
+    Stop-Script -Code 0 -Msg "DONE : ALREADY_INSTALLED"
+}
+
+if ($exitRaw -eq 3010 -or $exitUnsigned -eq 0x00240005) {
+    Request-RebootAndComplete -Reason ("WUSA_REBOOT_REQUIRED_{0}" -f $exitHex) -KB $kbNorm
+}
+
+if ($exitUnsigned -eq 0) {
+    $installedAfter = Test-KBInstalled -KB $kbNorm
+    $rebootPendingAfter = Test-RebootPending
+
+    Write-Output ("KB_VISIBLE_AFTER_INSTALL : {0}" -f $installedAfter)
+    Write-Output ("REBOOT_PENDING_AFTER_INSTALL : {0}" -f $rebootPendingAfter)
+
+    $newRebootPending = (-not $rebootPendingBefore -and $rebootPendingAfter)
+
+    if ($newRebootPending) {
+        Request-RebootAndComplete -Reason "NEW_REBOOT_PENDING_STATE_DETECTED" -KB $kbNorm
+    }
+
+    if ($installedAfter) {
+        Write-Output "PATCH_INSTALLED : $kbNorm"
+        Write-Output "NO_REBOOT_REQUIRED"
+
+        if ($rebootPendingBefore) {
+            Write-Output "PREEXISTING_REBOOT_PENDING_WARNING"
+        }
+
+        Try-Remove-TempDir -Reason "INSTALLED_NO_REBOOT"
+        Stop-Script -Code 0 -Msg "DONE : INSTALLED_NO_REBOOT"
+    }
+
+    Stop-Script -Code 30 -Msg "WUSA_SUCCESS_BUT_KB_NOT_FOUND"
+}
+
+Write-Output "WUSA_INSTALL_FAILED"
+Write-Output "REBOOT_SKIPPED : unsuccessful WUSA exit code"
+
+Stop-Script -Code 33 -Msg ("WUSA_INSTALL_FAILED : exitCode={0} hex={1}" -f $exitRaw, $exitHex)
