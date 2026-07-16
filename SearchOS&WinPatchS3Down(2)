@@ -1,0 +1,521 @@
+# =========================
+# 분기별 수정 영역
+# =========================
+$bucket = "버킷명"
+$S3Region = "ap-northeast-2"
+
+$KB2016  = "KB5099535"
+$Key2016 = "2026pm/02/windows/windows10.0-kb5099535-x64_272339725d88cf3a31a3ea9bf4e3e61ace5c2d91.msu"
+
+$KB2019  = "KB5099538"
+$Key2019 = "2026pm/02/windows10.0-kb5099538-x64_8ed669753c1d230738068aaac189c6457937dafb.msu"
+
+$KB2022  = "KB5099540"
+$Key2022 = "2026pm/02/windows10.0-kb5099540-x64_9238518dcf76e3b46d5c72e0392b0e04e5d2ae66.msu"
+
+# =========================
+# 공통 설정
+# =========================
+$TempDir = "C:\TempPM"
+$local = Join-Path $TempDir "windows-update-file.msu"
+$manifestPath = Join-Path $TempDir "patch-info.json"
+$S3DownloadTimeoutSec = 14400
+
+$script:RoleName = $null
+$script:RoleCredentials = $null
+
+function Stop-Script {
+    param([int]$Code, [string]$Msg)
+
+    Write-Output $Msg
+    Write-Output ("RESULT_CODE : {0}" -f $Code)
+    exit $Code
+}
+
+function Try-Remove-TempDir {
+    param([string]$Reason = "CLEANUP")
+
+    try {
+        if (Test-Path $TempDir) {
+            Remove-Item -Path $TempDir -Recurse -Force -ErrorAction Stop
+            Write-Output "TEMP_DIR_REMOVED : $TempDir : reason=$Reason"
+        } else {
+            Write-Output "TEMP_DIR_NOT_FOUND : $TempDir : reason=$Reason"
+        }
+    } catch {
+        Write-Output "TEMP_DIR_REMOVE_FAILED : $TempDir : reason=$Reason"
+        Write-Output $_.Exception.Message
+    }
+}
+
+function Test-KBInstalled {
+    param([string]$KB)
+
+    try {
+        $hotFix = Get-HotFix -Id $KB -ErrorAction SilentlyContinue
+        return ($null -ne $hotFix)
+    } catch {
+        Write-Output "KB_CHECK_WARNING : Get-HotFix query failed"
+        Write-Output $_.Exception.Message
+        return $false
+    }
+}
+
+function Get-Sha256Hex {
+    param([string]$Text)
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hash = $sha256.ComputeHash($bytes)
+
+        return ([System.BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+function Get-HmacSha256 {
+    param(
+        [byte[]]$Key,
+        [string]$Data
+    )
+
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+
+    try {
+        $hmac.Key = $Key
+        $result = $hmac.ComputeHash(
+            [System.Text.Encoding]::UTF8.GetBytes($Data)
+        )
+
+        return ,$result
+    } finally {
+        $hmac.Dispose()
+    }
+}
+
+function ConvertTo-S3CanonicalPath {
+    param([string]$Key)
+
+    $segments = $Key -split "/"
+
+    $encodedSegments = @(
+        $segments | ForEach-Object {
+            [System.Uri]::EscapeDataString($_)
+        }
+    )
+
+    return "/" + ($encodedSegments -join "/")
+}
+
+function Initialize-EC2RoleCredentials {
+    $metadataBase = "http://169.254.169.254/latest"
+
+    try {
+        $token = Invoke-RestMethod `
+            -Method Put `
+            -Uri "$metadataBase/api/token" `
+            -Headers @{
+                "X-aws-ec2-metadata-token-ttl-seconds" = "21600"
+            } `
+            -TimeoutSec 10 `
+            -ErrorAction Stop
+
+        $metadataHeaders = @{
+            "X-aws-ec2-metadata-token" = $token
+        }
+
+        $roleResponse = Invoke-RestMethod `
+            -Method Get `
+            -Uri "$metadataBase/meta-data/iam/security-credentials/" `
+            -Headers $metadataHeaders `
+            -TimeoutSec 10 `
+            -ErrorAction Stop
+
+        $roleNames = @(
+            ([string]$roleResponse -split "\s+") |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            }
+        )
+
+        if ($roleNames.Count -eq 0) {
+            Stop-Script -Code 40 -Msg "IAM_ROLE_NOT_FOUND"
+        }
+
+        $script:RoleName = [string]$roleNames[0]
+        $encodedRoleName = [System.Uri]::EscapeDataString($script:RoleName)
+
+        $script:RoleCredentials = Invoke-RestMethod `
+            -Method Get `
+            -Uri "$metadataBase/meta-data/iam/security-credentials/$encodedRoleName" `
+            -Headers $metadataHeaders `
+            -TimeoutSec 10 `
+            -ErrorAction Stop
+
+        if (
+            -not $script:RoleCredentials.AccessKeyId -or
+            -not $script:RoleCredentials.SecretAccessKey -or
+            -not $script:RoleCredentials.Token
+        ) {
+            Stop-Script -Code 41 -Msg "IAM_ROLE_CREDENTIALS_INVALID"
+        }
+
+        if (
+            $script:RoleCredentials.Code -and
+            [string]$script:RoleCredentials.Code -ne "Success"
+        ) {
+            Stop-Script `
+                -Code 41 `
+                -Msg ("IAM_ROLE_CREDENTIALS_ERROR : {0}" -f $script:RoleCredentials.Code)
+        }
+
+        Write-Output ("IAM_ROLE_FOUND : {0}" -f $script:RoleName)
+        Write-Output (
+            "IAM_ROLE_CREDENTIALS_EXPIRATION : {0}" -f
+            $script:RoleCredentials.Expiration
+        )
+    } catch {
+        Write-Output $_.Exception.Message
+        Stop-Script -Code 42 -Msg "IMDS_IAM_ROLE_CREDENTIALS_FAILED"
+    }
+}
+
+function Download-S3ObjectSigned {
+    param(
+        [string]$Bucket,
+        [string]$Region,
+        [string]$Key,
+        [string]$Destination
+    )
+
+    $credentials = $script:RoleCredentials
+    $service = "s3"
+    $method = "GET"
+
+    $hostName = "$Bucket.s3.$Region.amazonaws.com"
+    $canonicalUri = ConvertTo-S3CanonicalPath -Key $Key
+    $requestUri = "https://$hostName$canonicalUri"
+
+    $utcNow = (Get-Date).ToUniversalTime()
+    $amzDate = $utcNow.ToString("yyyyMMddTHHmmssZ")
+    $dateStamp = $utcNow.ToString("yyyyMMdd")
+
+    $payloadHash = Get-Sha256Hex -Text ""
+    $canonicalQueryString = ""
+
+    $canonicalHeaders = (@(
+        "host:$hostName"
+        "x-amz-content-sha256:$payloadHash"
+        "x-amz-date:$amzDate"
+        "x-amz-security-token:$($credentials.Token)"
+    ) -join "`n") + "`n"
+
+    $signedHeaders = "host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+
+    $canonicalRequest = "{0}`n{1}`n{2}`n{3}`n{4}`n{5}" -f `
+        $method,
+        $canonicalUri,
+        $canonicalQueryString,
+        $canonicalHeaders,
+        $signedHeaders,
+        $payloadHash
+
+    $algorithm = "AWS4-HMAC-SHA256"
+    $credentialScope = "$dateStamp/$Region/$service/aws4_request"
+
+    $canonicalRequestHash = Get-Sha256Hex -Text $canonicalRequest
+    $stringToSign = "$algorithm`n$amzDate`n$credentialScope`n$canonicalRequestHash"
+
+    $secretKeyBytes = [System.Text.Encoding]::UTF8.GetBytes(
+        "AWS4" + $credentials.SecretAccessKey
+    )
+
+    $kDate = Get-HmacSha256 `
+        -Key $secretKeyBytes `
+        -Data $dateStamp
+
+    $kRegion = Get-HmacSha256 `
+        -Key $kDate `
+        -Data $Region
+
+    $kService = Get-HmacSha256 `
+        -Key $kRegion `
+        -Data $service
+
+    $kSigning = Get-HmacSha256 `
+        -Key $kService `
+        -Data "aws4_request"
+
+    $signatureBytes = Get-HmacSha256 `
+        -Key $kSigning `
+        -Data $stringToSign
+
+    $signature = (
+        [System.BitConverter]::ToString($signatureBytes)
+    ).Replace("-", "").ToLowerInvariant()
+
+    $authorizationHeader = (
+        "$algorithm Credential=$($credentials.AccessKeyId)/$credentialScope, " +
+        "SignedHeaders=$signedHeaders, Signature=$signature"
+    )
+
+    $requestHeaders = @{
+        "Authorization"        = $authorizationHeader
+        "x-amz-date"           = $amzDate
+        "x-amz-content-sha256" = $payloadHash
+        "x-amz-security-token" = $credentials.Token
+    }
+
+    Write-Output "S3_DOWNLOAD_START"
+    Write-Output ("S3_SOURCE : s3://{0}/{1}" -f $Bucket, $Key)
+    Write-Output ("S3_ENDPOINT : {0}" -f $hostName)
+    Write-Output ("LOCAL_TARGET : {0}" -f $Destination)
+    Write-Output ("REQUEST_UTC : {0}" -f $amzDate)
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.ServicePointManager]::SecurityProtocol -bor `
+            [Net.SecurityProtocolType]::Tls12
+
+        Invoke-WebRequest `
+            -Method Get `
+            -Uri $requestUri `
+            -Headers $requestHeaders `
+            -OutFile $Destination `
+            -UseBasicParsing `
+            -TimeoutSec $S3DownloadTimeoutSec `
+            -ErrorAction Stop | Out-Null
+    } catch {
+        if (Test-Path $Destination) {
+            Remove-Item `
+                -Path $Destination `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+
+        Write-Output (
+            "S3_DOWNLOAD_EXCEPTION : {0}" -f
+            $_.Exception.Message
+        )
+
+        if ($_.Exception.Response) {
+            try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $statusDescription = $_.Exception.Response.StatusDescription
+
+                Write-Output (
+                    "S3_HTTP_STATUS : {0} {1}" -f
+                    $statusCode,
+                    $statusDescription
+                )
+            } catch {
+            }
+        }
+
+        Stop-Script -Code 43 -Msg "S3_SIGNED_DOWNLOAD_FAILED"
+    }
+}
+
+# =========================
+# 0) 현재 PowerShell 프로세스의 프록시 미사용
+# =========================
+try {
+    [System.Net.WebRequest]::DefaultWebProxy = `
+        [System.Net.GlobalProxySelection]::GetEmptyWebProxy()
+
+    Write-Output "PROCESS_WEB_PROXY_DISABLED"
+} catch {
+    Write-Output "PROCESS_WEB_PROXY_DISABLE_WARNING"
+    Write-Output $_.Exception.Message
+}
+
+# =========================
+# 1) OS 제품명 자동 판별
+# =========================
+try {
+    $osInfo = Get-CimInstance `
+        -ClassName Win32_OperatingSystem `
+        -ErrorAction Stop
+
+    $osCaption = [string]$osInfo.Caption
+    $osProductType = [int]$osInfo.ProductType
+} catch {
+    Write-Output $_.Exception.Message
+    Stop-Script -Code 5 -Msg "OS_DETECTION_FAILED"
+}
+
+if ($osProductType -eq 1) {
+    Stop-Script `
+        -Code 6 `
+        -Msg ("UNSUPPORTED_OS : Windows client OS detected : {0}" -f $osCaption)
+}
+
+switch -Wildcard ($osCaption) {
+    "*Windows Server 2016*" {
+        $osYear = "2016"
+        $kb = $KB2016
+        $key = $Key2016
+        break
+    }
+
+    "*Windows Server 2019*" {
+        $osYear = "2019"
+        $kb = $KB2019
+        $key = $Key2019
+        break
+    }
+
+    "*Windows Server 2022*" {
+        $osYear = "2022"
+        $kb = $KB2022
+        $key = $Key2022
+        break
+    }
+
+    default {
+        Stop-Script `
+            -Code 7 `
+            -Msg ("UNSUPPORTED_OS : caption={0}" -f $osCaption)
+    }
+}
+
+$kbNorm = $kb.ToUpper()
+
+Write-Output (
+    "OS_DETECTED : year={0} caption={1}" -f
+    $osYear,
+    $osCaption
+)
+
+Write-Output (
+    "PATCH_SELECTED : kb={0} key={1}" -f
+    $kbNorm,
+    $key
+)
+
+# =========================
+# 2) 기존 설치 여부 확인
+# =========================
+if (Test-KBInstalled -KB $kbNorm) {
+    Write-Output "PATCH_ALREADY_INSTALLED : $kbNorm"
+    Write-Output "NO_ACTION : download/install/reboot skipped"
+
+    Try-Remove-TempDir -Reason "ALREADY_INSTALLED"
+    Stop-Script -Code 0 -Msg "DONE : ALREADY_INSTALLED"
+}
+
+# =========================
+# 3) 작업 폴더 및 기존 파일 정리
+# =========================
+try {
+    New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path $TempDir `
+        -ErrorAction Stop | Out-Null
+
+    if (Test-Path $local) {
+        Remove-Item `
+            -Path $local `
+            -Force `
+            -ErrorAction Stop
+
+        Write-Output "OLD_PATCH_FILE_REMOVED"
+    }
+
+    if (Test-Path $manifestPath) {
+        Remove-Item `
+            -Path $manifestPath `
+            -Force `
+            -ErrorAction Stop
+
+        Write-Output "OLD_PATCH_MANIFEST_REMOVED"
+    }
+} catch {
+    Write-Output $_.Exception.Message
+    Stop-Script -Code 8 -Msg "TEMP_FILE_PREPARE_FAILED"
+}
+
+# =========================
+# 4) EC2 IAM Role 임시 자격 증명 확인
+# =========================
+Initialize-EC2RoleCredentials
+
+# =========================
+# 5) S3 GetObject 다운로드
+# =========================
+Download-S3ObjectSigned `
+    -Bucket $bucket `
+    -Region $S3Region `
+    -Key $key `
+    -Destination $local
+
+if (-not (Test-Path $local)) {
+    Stop-Script `
+        -Code 20 `
+        -Msg "S3_DOWNLOAD_FAILED : local file not found"
+}
+
+$fileInfo = Get-Item $local
+
+if ($fileInfo.Length -le 0) {
+    Stop-Script `
+        -Code 21 `
+        -Msg "S3_DOWNLOAD_FAILED : downloaded file size is zero"
+}
+
+# =========================
+# 6) Manifest 생성
+# =========================
+try {
+    $fileHash = Get-FileHash `
+        -Path $local `
+        -Algorithm SHA256 `
+        -ErrorAction Stop
+
+    $manifest = [PSCustomObject]@{
+        OSYear       = $osYear
+        OSCaption    = $osCaption
+        KB           = $kbNorm
+        S3Bucket     = $bucket
+        S3Region     = $S3Region
+        S3Key        = $key
+        LocalPath    = $local
+        SizeBytes    = $fileInfo.Length
+        SHA256       = $fileHash.Hash
+        DownloadedAt = (Get-Date).ToString("o")
+    }
+
+    $manifest |
+        ConvertTo-Json |
+        Set-Content `
+            -Path $manifestPath `
+            -Encoding UTF8 `
+            -ErrorAction Stop
+} catch {
+    Write-Output $_.Exception.Message
+    Stop-Script -Code 22 -Msg "PATCH_MANIFEST_CREATE_FAILED"
+}
+
+Write-Output "S3_DOWNLOAD_OK"
+
+Write-Output (
+    "DOWNLOADED_FILE : path={0} size={1}" -f
+    $fileInfo.FullName,
+    $fileInfo.Length
+)
+
+Write-Output (
+    "DOWNLOADED_SHA256 : {0}" -f
+    $fileHash.Hash
+)
+
+Write-Output (
+    "PATCH_MANIFEST_CREATED : {0}" -f
+    $manifestPath
+)
+
+Stop-Script -Code 0 -Msg "DONE : DOWNLOAD_COMPLETED"
