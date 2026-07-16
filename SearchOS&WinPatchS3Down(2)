@@ -5,7 +5,7 @@ $bucket = "버킷명"
 $S3Region = "ap-northeast-2"
 
 $KB2016  = "KB5099535"
-$Key2016 = "2026pm/02/windows/windows10.0-kb5099535-x64_272339725d88cf3a31a3ea9bf4e3e61ace5c2d91.msu"
+$Key2016 = "2026pm/02/windows10.0-kb5099535-x64_272339725d88cf3a31a3ea9bf4e3e61ace5c2d91.msu"
 
 $KB2019  = "KB5099538"
 $Key2019 = "2026pm/02/windows10.0-kb5099538-x64_8ed669753c1d230738068aaac189c6457937dafb.msu"
