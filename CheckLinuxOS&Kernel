@@ -1,0 +1,123 @@
+#!/bin/sh
+
+# ============================================================
+# 1. OS 정보 확인
+# ============================================================
+if [ ! -r /etc/os-release ]; then
+    echo "ERROR /etc/os-release 확인 불가"
+    exit 1
+fi
+
+. /etc/os-release
+
+OS_ID="${ID:-unknown}"
+OS_VERSION="${VERSION_ID:-unknown}"
+OS_MAJOR="${OS_VERSION%%.*}"
+
+if [ "${OS_ID}" = "unknown" ] || [ "${OS_VERSION}" = "unknown" ]; then
+    echo "ERROR OS 정보 확인 실패"
+    exit 2
+fi
+
+# ============================================================
+# 2. OS 종류 및 버전별 명령어 그룹 지정
+# ============================================================
+case "${OS_ID}" in
+    amzn)
+        case "${OS_MAJOR}" in
+            2)
+                COMMAND_GROUP="AMAZON_LINUX_2"
+                ;;
+            2023)
+                COMMAND_GROUP="AMAZON_LINUX_2023"
+                ;;
+            *)
+                COMMAND_GROUP="AMAZON_LINUX_${OS_MAJOR}"
+                ;;
+        esac
+        ;;
+
+    rhel)
+        COMMAND_GROUP="RHEL_${OS_MAJOR}"
+        ;;
+
+    centos)
+        COMMAND_GROUP="CENTOS_${OS_MAJOR}"
+        ;;
+
+    rocky)
+        COMMAND_GROUP="ROCKY_LINUX_${OS_MAJOR}"
+        ;;
+
+    almalinux)
+        COMMAND_GROUP="ALMALINUX_${OS_MAJOR}"
+        ;;
+
+    ol)
+        COMMAND_GROUP="ORACLE_LINUX_${OS_MAJOR}"
+        ;;
+
+    ubuntu)
+        COMMAND_GROUP="UBUNTU_${OS_MAJOR}"
+        ;;
+
+    debian)
+        COMMAND_GROUP="DEBIAN_${OS_MAJOR}"
+        ;;
+
+    sles)
+        COMMAND_GROUP="SLES_${OS_MAJOR}"
+        ;;
+
+    opensuse-leap|opensuse-tumbleweed)
+        COMMAND_GROUP="OPENSUSE_${OS_MAJOR}"
+        ;;
+
+    fedora)
+        COMMAND_GROUP="FEDORA_${OS_MAJOR}"
+        ;;
+
+    *)
+        echo "ERROR 지원하지 않는 OS: ${OS_ID} ${OS_VERSION}"
+        exit 3
+        ;;
+esac
+
+# ============================================================
+# 3. 현재 실행 중인 커널 확인
+# ============================================================
+case "${COMMAND_GROUP}" in
+    AMAZON_LINUX_*|\
+    RHEL_*|\
+    CENTOS_*|\
+    ROCKY_LINUX_*|\
+    ALMALINUX_*|\
+    ORACLE_LINUX_*|\
+    UBUNTU_*|\
+    DEBIAN_*|\
+    SLES_*|\
+    OPENSUSE_*|\
+    FEDORA_*)
+        CURRENT_KERNEL="$(uname -r 2>/dev/null)"
+        ;;
+
+    *)
+        echo "ERROR 명령어 그룹 확인 실패: ${COMMAND_GROUP}"
+        exit 4
+        ;;
+esac
+
+if [ -z "${CURRENT_KERNEL:-}" ]; then
+    echo "ERROR 현재 커널 확인 실패"
+    exit 5
+fi
+
+# ============================================================
+# 4. 결과 출력
+# ============================================================
+printf '(%s %s) %s\n' \
+    "${OS_ID}" \
+    "${OS_VERSION}" \
+    "${CURRENT_KERNEL}"
+
+exit 0
